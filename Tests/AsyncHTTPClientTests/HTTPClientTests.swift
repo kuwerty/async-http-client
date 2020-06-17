@@ -2040,6 +2040,144 @@ class HTTPClientTests: XCTestCase {
         }
     }
 
+    func testConnectTimeoutPropagatedToDelegate() throws {
+        // Server that will delay each response
+        final class TestServer {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let serverChannel: Channel
+            let isShutdown: NIOAtomic<Bool> = .makeAtomic(value: false)
+
+            var port: Int {
+                return Int(self.serverChannel.localAddress!.port!)
+            }
+
+            final class DelayReadByFourSecondsHandler: ChannelDuplexHandler {
+                typealias InboundIn = Channel
+                typealias OutboundIn = Never
+
+                func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+                    // print("server accepted connection from \(self.unwrapInboundIn(data).remoteAddress!)")
+                    context.fireChannelRead(data)
+                }
+
+                func read(context: ChannelHandlerContext) {
+                    // Client will timeout.
+                    context.eventLoop.scheduleTask(in: .seconds(2)) {
+                        context.read()
+                    }
+                }
+            }
+
+            final class SendBackCannedResponseHandler: ChannelInboundHandler {
+                typealias InboundIn = ByteBuffer
+                typealias OutboundOut = ByteBuffer
+
+                func channelActive(context: ChannelHandlerContext) {
+                    // Four seconds after we accepted a connection, send back some bytes.
+                    context.eventLoop.scheduleTask(in: .seconds(4)) {
+                        let buffer = context.channel.allocator.buffer(string: "HTTP/1.0 200 OK\nContent-Length:5\n\nHello")
+                        context.writeAndFlush(self.wrapOutboundOut(buffer)).whenComplete { _ in
+                            context.channel.close(promise: nil)
+                        }
+                    }
+                }
+            }
+
+            init() throws {
+                self.serverChannel = try ServerBootstrap(group: group)
+                        .serverChannelOption(ChannelOptions.backlog, value: 1) // Backlog 1
+                        .serverChannelOption(ChannelOptions.maxMessagesPerRead, value: 1) // Accept only 1 connection at a time.
+                        .serverChannelInitializer { channel in
+                            // In the server channel (where we accept connections), we want to delay the accepting.
+                            channel.pipeline.addHandler(DelayReadByFourSecondsHandler())
+                        }
+                        .childChannelInitializer { channel in
+                            // In the client channel (the actual TCP connection), we want to send back a canned response.
+                            channel.pipeline.addHandler(SendBackCannedResponseHandler())
+                        }
+                        .bind(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)) // random address
+                        .wait()
+            }
+
+            deinit {
+                assert(self.isShutdown.load(), "TestServer not shutdown before deinit")
+            }
+
+            func shutdown() throws {
+                self.isShutdown.store(true)
+                try self.group.syncShutdownGracefully()
+            }
+        }
+
+        final class TestDelegate: HTTPClientResponseDelegate {
+            typealias Response = Void
+            var error: Error?
+            func didFinishRequest(task: HTTPClient.Task<Void>) throws {}
+            func didReceiveError(task: HTTPClient.Task<Response>, _ error: Error) {
+                self.error = error
+            }
+        }
+
+        let timeout = AsyncHTTPClient.HTTPClient.Configuration.Timeout(connect: .seconds(1), read: .seconds(1))
+
+        let configuration = HTTPClient.Configuration(timeout: timeout)
+
+        let httpClient = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup), configuration: configuration)
+        defer {
+            XCTAssertNoThrow(try httpClient.syncShutdown())
+        }
+
+        let server = try! TestServer()
+        defer {
+            XCTAssertNoThrow(try server.shutdown())
+        }
+
+        var tasks = [(TestDelegate, HTTPClient.Task<Void>)]()
+
+        //
+        // Start 10 requests
+        //
+        for _ in 0..<7 {
+            let delegate = TestDelegate()
+            let request = try! HTTPClient.Request(url: "http://localhost:\(server.port)/")
+            let task = httpClient.execute(request: request, delegate: delegate)
+
+            tasks.append((delegate,task))
+        }
+
+        //
+        // There should be a sequence of readTimeout errors and then some connectTimeouts. The exact
+        // sequence isn't known but we should see both.
+        //
+        var sawReadTimeout = false
+        var sawConnectError = false
+
+        for (delegate, task) in tasks {
+            do {
+                try task.wait()
+            } catch {
+                // Errors in delegate and task should be equivalent.
+                switch (error, delegate.error) {
+                    case (ChannelError.connectTimeout, .some(ChannelError.connectTimeout)):
+                        sawConnectError = true
+                        break
+                    case let (taskError as HTTPClientError, delegateError as HTTPClientError):
+                        XCTAssert(taskError == .readTimeout)
+                        XCTAssert(delegateError == .readTimeout)
+                        sawReadTimeout = true
+                        break
+                    case (_ as NIOConnectionError, .none):
+                        XCTFail("Delegate error is not \(error)")
+                    default:
+                        XCTFail("Unexpected error: \(error)")
+                }
+            }
+        }
+
+        XCTAssertTrue(sawReadTimeout)
+        XCTAssertTrue(sawConnectError)
+    }
+
     func testDelegateCallinsTolerateRandomEL() throws {
         class TestDelegate: HTTPClientResponseDelegate {
             typealias Response = Void
